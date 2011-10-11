@@ -205,10 +205,18 @@ fn type_of_inner(cx: @crate_ctxt, sp: span, t: ty::t)
         }
         T_struct(tys)
       }
-      ty::ty_fn(_, _, _, _, _) {
+      ty::ty_fn(proto, _, _, _, _) {
         // FIXME: could be a constraint on ty_fn
         check returns_non_ty_var(cx, t);
-        T_fn_pair(*cx, type_of_fn_from_ty(cx, sp, t, 0u))
+        let llfnty = type_of_fn_from_ty(cx, sp, t, 0u);
+        alt proto {
+          ast::proto_bare. {
+            T_ptr(llfnty)
+          }
+          _ {
+            T_fn_pair(*cx, llfnty)
+          }
+        }
       }
       ty::ty_native_fn(abi, args, out) {
         if native_abi_requires_pair(abi) {
@@ -1429,9 +1437,15 @@ fn make_drop_glue(bcx: @block_ctxt, v0: ValueRef, t: ty::t) {
           ty::ty_res(did, inner, tps) {
             trans_res_drop(bcx, v0, did, inner, tps)
           }
-          ty::ty_fn(_, _, _, _, _) {
-            let box_cell = GEP(bcx, v0, [C_int(0), C_int(abi::fn_field_box)]);
-            decr_refcnt_maybe_free(bcx, Load(bcx, box_cell), t)
+          ty::ty_fn(proto, _, _, _, _) {
+            alt proto {
+              ast::proto_bare. { bcx }
+              _ {
+                let box_cell = GEP(bcx, v0, [C_int(0),
+                                             C_int(abi::fn_field_box)]);
+                decr_refcnt_maybe_free(bcx, Load(bcx, box_cell), t)
+              }
+            }
           }
           _ {
             if ty::type_has_pointers(ccx.tcx, t) &&
@@ -1754,6 +1768,7 @@ fn iter_structural_ty(cx: @block_ctxt, av: ValueRef, t: ty::t,
         }
         ret next_cx;
       }
+      ty::ty_fn(ast::proto_bare., _, _, _, _) { ret cx; }
       ty::ty_fn(_, _, _, _, _) | ty::ty_native_fn(_, _, _) {
         let box_cell_a = GEP(cx, av, [C_int(0), C_int(abi::fn_field_box)]);
         ret iter_boxpp(cx, box_cell_a, f);
@@ -2297,7 +2312,14 @@ fn trans_expr_fn(bcx: @block_ctxt, f: ast::_fn, sp: span,
         trans_closure(sub_cx, sp, f, llfn, none, [], id, {|_fcx|});
       }
     };
-    fill_fn_pair(bcx, get_dest_addr(dest), llfn, env);
+    alt f.proto {
+      ast::proto_bare. {
+        Store(bcx, llfn, get_dest_addr(dest));
+      }
+      _ {
+        fill_fn_pair(bcx, get_dest_addr(dest), llfn, env);
+      }
+    }
     ret bcx;
 }
 
@@ -2987,7 +3009,7 @@ type generic_info =
 
 tag lval_kind { temporary; owned; owned_imm; }
 type lval_result = {bcx: @block_ctxt, val: ValueRef, kind: lval_kind};
-tag callee_env { obj_env(ValueRef); null_env; is_closure; }
+tag callee_env { obj_env(ValueRef); null_env; no_env; is_closure; }
 type lval_maybe_callee = {bcx: @block_ctxt,
                           val: ValueRef,
                           kind: lval_kind,
@@ -3147,7 +3169,16 @@ fn trans_var(cx: @block_ctxt, sp: span, def: ast::def, id: ast::node_id)
       }
       _ {
         let loc = trans_local_var(cx, def);
-        ret lval_no_env(loc.bcx, loc.val, loc.kind);
+        let tp = ty::node_id_to_monotype(ccx.tcx, id);
+        alt ty::struct(ccx.tcx, tp) {
+          ty::ty_fn(ast::proto_bare.,_,_,_,_) {
+            ret {bcx: loc.bcx, val: loc.val,
+                 kind: loc.kind, env: no_env, generic: none};
+          }
+          _ {
+            ret lval_no_env(loc.bcx, loc.val, loc.kind);
+          }
+        }
       }
     }
 }
@@ -3346,6 +3377,7 @@ fn trans_lval(cx: @block_ctxt, e: @ast::expr) -> lval_result {
 fn maybe_add_env(bcx: @block_ctxt, c: lval_maybe_callee)
     -> (lval_kind, ValueRef) {
     alt c.env {
+      no_env. { (c.kind, c.val) }
       is_closure. { (c.kind, c.val) }
       obj_env(_) {
         fail "Taking the value of a method does not work yet (issue #435)";
@@ -3935,6 +3967,11 @@ fn trans_call(in_cx: @block_ctxt, f: @ast::expr,
     let llenv;
     alt f_res.env {
       null_env. {
+        llenv = llvm::LLVMGetUndef(T_opaque_closure_ptr(*bcx_ccx(cx)));
+      }
+      no_env. {
+        // Bare functions. They still aren't immediates so need to be loaded
+        faddr = Load(bcx, faddr);
         llenv = llvm::LLVMGetUndef(T_opaque_closure_ptr(*bcx_ccx(cx)));
       }
       obj_env(e) { llenv = e; }
